@@ -4,6 +4,7 @@ import time
 
 from collections import OrderedDict
 from warnings import warn
+from xml.sax.handler import feature_external_ges
 
 from flask import (
     Blueprint,
@@ -16,7 +17,7 @@ from flask import (
     g,
 )
 from werkzeug.exceptions import Forbidden, NotFound, BadRequest, Conflict
-from sqlalchemy import distinct, func, desc, asc, select, text, update
+from sqlalchemy import distinct, func, desc, asc, select, case
 from sqlalchemy.orm import joinedload, contains_eager, lazyload, selectinload
 from geojson import FeatureCollection, Feature
 import sqlalchemy as sa
@@ -24,7 +25,6 @@ import sqlalchemy as sa
 from utils_flask_sqla.generic import serializeQuery, GenericTable
 from utils_flask_sqla.response import to_csv_resp, to_json_resp, json_resp
 from utils_flask_sqla_geo.generic import GenericTableGeo
-
 
 from geonature.utils import filemanager
 from geonature.utils.env import DB
@@ -117,6 +117,7 @@ def get_observations_for_web(info_role):
     :>jsonarr int nb_total: Number of observations
     :>jsonarr bool nb_obs_limited: Is number of observations capped
     """
+
     if request.is_json:
         filters = request.json
     elif request.data:
@@ -126,58 +127,101 @@ def get_observations_for_web(info_role):
         filters = {key: request.args.get(key) for key, value in request.args.items()}
 
     if "limit" in filters:
-        result_limit = filters.pop("limit")
+        result_limit = int(filters.pop("limit"))
     else:
         result_limit = current_app.config["SYNTHESE"]["NB_MAX_OBS_MAP"]
 
-    query = (
-        select(
-            [
-                VSyntheseForWebApp.id_synthese,
-                VSyntheseForWebApp.date_min,
-                VSyntheseForWebApp.lb_nom,
-                VSyntheseForWebApp.cd_nom,
-                VSyntheseForWebApp.nom_vern,
-                VSyntheseForWebApp.count_min,
-                VSyntheseForWebApp.count_max,
-                VSyntheseForWebApp.st_asgeojson,
-                VSyntheseForWebApp.observers,
-                VSyntheseForWebApp.dataset_name,
-                VSyntheseForWebApp.url_source,
-                VSyntheseForWebApp.entity_source_pk_value,
-                VSyntheseForWebApp.unique_id_sinp,
-            ]
-        )
+    count_min_max = case(
+        [
+            (
+                VSyntheseForWebApp.count_min != VSyntheseForWebApp.count_max,
+                func.concat(VSyntheseForWebApp.count_min, " - ", VSyntheseForWebApp.count_max),
+            ),
+            (VSyntheseForWebApp.count_min != None, func.concat(VSyntheseForWebApp.count_min)),
+        ],
+        else_="",
+    )
+
+    nom_vern_or_lb_nom = func.coalesce(
+        func.nullif(VSyntheseForWebApp.nom_vern, ""), VSyntheseForWebApp.lb_nom
+    )
+
+    columns = [
+        "id",
+        VSyntheseForWebApp.id_synthese,
+        "date_min",
+        VSyntheseForWebApp.date_min,
+        "lb_nom",
+        VSyntheseForWebApp.lb_nom,
+        "cd_nom",
+        VSyntheseForWebApp.cd_nom,
+        "observers",
+        VSyntheseForWebApp.observers,
+        "dataset_name",
+        VSyntheseForWebApp.dataset_name,
+        "url_source",
+        VSyntheseForWebApp.url_source,
+        "unique_id_sinp",
+        VSyntheseForWebApp.unique_id_sinp,
+        "nom_vern_or_lb_nom",
+        nom_vern_or_lb_nom,
+        "count_min_max",
+        count_min_max,
+    ]
+    observations = func.json_build_object(*columns).label("obs_as_json")
+
+    if "with_areas" in filters and (
+        filters["with_areas"] in ["1", "true"] or filters["with_areas"] == True
+    ):
+        geom_4326 = LAreas.geom
+    else:
+        geom_4326 = VSyntheseForWebApp.the_geom_4326.label("geom")
+
+    obs_query = (
+        select([geom_4326, observations])
         .where(VSyntheseForWebApp.the_geom_4326.isnot(None))
         .order_by(VSyntheseForWebApp.date_min.desc())
+        .limit(result_limit)
     )
-    synthese_query_class = SyntheseQuery(VSyntheseForWebApp, query, filters)
+
+    # Add filters to CTE query
+    synthese_query_class = SyntheseQuery(
+        VSyntheseForWebApp,
+        obs_query,
+        filters,
+        areas_type=current_app.config["SYNTHESE"]["AREA_AGGREGATION_TYPE"],
+    )
     synthese_query_class.filter_query_all_filters(info_role)
-    result = DB.session.execute(synthese_query_class.query.limit(result_limit))
+    query_cte = synthese_query_class.query.cte("query_cte")
+
+    # Group geometries with main query
+
+    if "with_areas" in filters and (
+        filters["with_areas"][0] in ["1", "true"] or filters["with_areas"][0] == True
+    ):
+        st_asgeojson = func.ST_Transform(query_cte.c.geom, 4326)
+    else:
+        st_asgeojson = query_cte.c.geom
+
+    properties = func.json_build_object(
+        "observations", func.json_agg(query_cte.c.obs_as_json).label("observations")
+    )
+
+    query = select([func.ST_AsGeoJSON(st_asgeojson).label("st_asgeojson"), properties]).group_by(
+        query_cte.c.geom
+    )
+    results = DB.session.execute(query)
+
+    # Build GeoJson
     geojson_features = []
-    for r in result:
-        properties = {
-            "id": r["id_synthese"],
-            "date_min": str(r["date_min"]),
-            "cd_nom": r["cd_nom"],
-            "nom_vern_or_lb_nom": r["nom_vern"] if r["nom_vern"] else r["lb_nom"],
-            "lb_nom": r["lb_nom"],
-            "count_min_max": "{} - {}".format(r["count_min"], r["count_max"])
-            if r["count_min"] != r["count_max"]
-            else str(r["count_min"] or ""),
-            "dataset_name": r["dataset_name"],
-            "observers": r["observers"],
-            "url_source": r["url_source"],
-            "unique_id_sinp": str(r["unique_id_sinp"]),
-            "entity_source_pk_value": r["entity_source_pk_value"],
-        }
-        geometry = json.loads(r["st_asgeojson"])
+    for (geom_as_geojson, properties) in results:
         geojson_features.append(
             Feature(
-                geometry=geometry,
+                geometry=json.loads(geom_as_geojson),
                 properties=properties,
             )
         )
+
     return jsonify(FeatureCollection(geojson_features))
 
 

@@ -10,6 +10,7 @@ import { SyntheseModalDownloadComponent } from './synthese-results/synthese-list
 import { AppConfig } from '@geonature_config/app.config';
 import { ToastrService } from 'ngx-toastr';
 import { ActivatedRoute } from '@angular/router';
+import * as cloneDeep from 'lodash/cloneDeep';
 
 @Component({
   selector: 'pnx-synthese',
@@ -38,7 +39,11 @@ export class SyntheseComponent implements OnInit {
     this.searchService.dataLoaded = false;
     this.searchService.getSyntheseData(formParams).subscribe(
       (data) => {
-        if (data.length >= AppConfig.SYNTHESE.NB_MAX_OBS_MAP) {
+        // Store the list of id_synthese for exports
+        this._syntheseStore.idSyntheseList = this.extractSyntheseIds(data);
+
+        // Check if synthese observations limit is reach
+        if (this._syntheseStore.idSyntheseList.length >= AppConfig.SYNTHESE.NB_MAX_OBS_MAP) {
           const modalRef = this._modalService.open(SyntheseModalDownloadComponent, {
             size: 'lg',
           });
@@ -46,15 +51,12 @@ export class SyntheseComponent implements OnInit {
           modalRef.componentInstance.queryString = this.searchService.buildQueryUrl(formatedParams);
           modalRef.componentInstance.tooManyObs = true;
         }
-        this._mapListService.geojsonData = data;
-        this._mapListService.tableData = data;
+
+        // Store geojson
+        this._mapListService.geojsonData = this.simplifyGeoJson(cloneDeep(data));
         this._mapListService.loadTableData(data);
         this._mapListService.idName = 'id';
         this.searchService.dataLoaded = true;
-        // store the list of id_synthese for exports
-        this._syntheseStore.idSyntheseList = data['features'].map((row) => {
-          return row['properties']['id'];
-        });
       },
       (error) => {
         this.searchService.dataLoaded = true;
@@ -74,15 +76,42 @@ export class SyntheseComponent implements OnInit {
     this.firstLoad = false;
   }
 
+  private extractSyntheseIds(geojson) {
+    let ids = [];
+    for (let feature of geojson.features) {
+      for (let obs of Object.values(feature.properties.observations)) {
+        ids.push(obs['id']);
+      }
+    }
+    return ids;
+  }
+
+  private simplifyGeoJson(geojson) {
+    for (let feature of geojson.features) {
+      let ids = [];
+      for (let obs of Object.values(feature.properties.observations)) {
+        if (obs['id']) {
+          ids.push(obs['id']);
+        }
+      }
+      feature.properties.observations = { id: ids };
+    }
+    return geojson;
+  }
+
   ngOnInit() {
     this._route.queryParamMap.subscribe((params) => {
-      let initialFilter = {};
+      let initialFilter = {
+        with_areas:
+          AppConfig.SYNTHESE.ENABLE_AREA_AGGREGATION &&
+          AppConfig.SYNTHESE.AREA_AGGREGATION_BY_DEFAULT,
+      };
       if (params.get('id_acquisition_framework')) {
         initialFilter['id_acquisition_framework'] = params.get('id_acquisition_framework');
       } else if (params.get('id_dataset')) {
         initialFilter['id_dataset'] = params.get('id_dataset');
       } else {
-        initialFilter = { limit: AppConfig.SYNTHESE.NB_LAST_OBS };
+        initialFilter['limit'] = AppConfig.SYNTHESE.NB_LAST_OBS;
       }
 
       // reinitialize the form
